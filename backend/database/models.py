@@ -49,3 +49,26 @@ class DailyEntry(Base):
     payment_method = Column(String, nullable=True)  # Cash / UPI / Credit Card / Debit Card / Net Banking / Other
     note = Column(Text, nullable=True)
     created_at = Column(String)
+
+
+class LoanPrediction(Base):
+    """Stored loan risk prediction results per user."""
+    __tablename__ = "loan_predictions"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    customer_id = Column(String, ForeignKey("customers.customer_id"), index=True)
+    # Inputs
+    loan_type = Column(String, nullable=True)
+    monthly_income = Column(Float)
+    credit_score = Column(Integer)
+    employment_years = Column(Float)
+    requested_amount = Column(Float)
+    tenure_months = Column(Integer)
+    existing_debt = Column(Float)
+    # Outputs
+    approval_probability = Column(Float)
+    default_probability = Column(Float)
+    risk_level = Column(String)          # LOW / MEDIUM / HIGH
+    recommended_amount = Column(Float)
+    recommended_tenure = Column(Integer)
+    explanation = Column(Text)           # JSON-encoded list of strings
+    created_at = Column(String)

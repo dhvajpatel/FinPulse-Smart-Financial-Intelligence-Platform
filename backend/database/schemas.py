@@ -113,12 +113,32 @@ class LoanPredictRequest(BaseModel):
 
 
 class LoanPredictResponse(BaseModel):
+    id: Optional[int] = None          # DB row id (None for anonymous calls)
     approval_probability: float
     default_probability: float
     risk_level: str
     recommended_amount: float
     recommended_tenure: int
     explanation: List[str]
+
+
+class LoanPredictionHistory(BaseModel):
+    id: int
+    customer_id: str
+    loan_type: Optional[str]
+    monthly_income: float
+    credit_score: int
+    employment_years: float
+    requested_amount: float
+    tenure_months: int
+    existing_debt: float
+    approval_probability: float
+    default_probability: float
+    risk_level: str
+    recommended_amount: float
+    recommended_tenure: int
+    explanation: List[str]
+    created_at: str
 
 
 # ── Recommendations ───────────────────────────────────────────────────────────
