@@ -8,7 +8,6 @@
 </p>
 
 # FinPulse — AI-Powered Banking Intelligence Platform
-[ FinPulse Are Live On:- https://frontend-seven-wine-u47eoxrzkq.vercel.app/login ]
 
 
 
