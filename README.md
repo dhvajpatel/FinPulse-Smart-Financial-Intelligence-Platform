@@ -2,10 +2,11 @@
   <img src="assets/finpulse-icon.png" alt="FinPulse App Icon" width="160" />
 </p>
 
-<h1 align="center">  Smart Financial Intelligence Platform </h1>
+<h1 align="center"> FinPulse </h1>
 
 <p align="center">
 </p>
+
 # FinPulse — AI-Powered Banking Intelligence Platform
 [ FinPulse Are Live On:- https://frontend-seven-wine-u47eoxrzkq.vercel.app/login ]
 
