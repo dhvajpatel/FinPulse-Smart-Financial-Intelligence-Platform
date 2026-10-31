@@ -5,10 +5,10 @@ services:
     region: oregon
     plan: free
     rootDir: backend
-    # At build time: install deps, then build the SQLite DB from the committed CSVs
+    # Install dependencies and initialise the database schema (no CSV seeding)
     buildCommand: pip install -r requirements.txt && python load_data.py
-    # At start time: launch FastAPI
+    # Launch FastAPI
     startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
     envVars:
       - key: PYTHON_VERSION
-        value: 3.11.0
+        value: "3.11.0"
