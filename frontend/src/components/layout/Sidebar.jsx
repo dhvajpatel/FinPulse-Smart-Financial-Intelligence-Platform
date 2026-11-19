@@ -37,7 +37,7 @@ export default function Sidebar() {
       {/* Brand */}
       <div className="flex items-center gap-2.5 px-6 h-16 border-b border-border">
         <img
-          src="/smart bank ai icon.png"
+          src="/icon.png"
           alt="FinPulse"
           className="h-8 w-8 rounded-lg object-cover shrink-0"
         />
