@@ -8,7 +8,6 @@ export const client = axios.create({
 });
 
 // ── Auth token interceptor ────────────────────────────────────────────────────
-// Reads the JWT from sessionStorage and attaches it to every request.
 client.interceptors.request.use((config) => {
   try {
     const raw = sessionStorage.getItem("finpulse_session");
@@ -68,6 +67,9 @@ export const getSpendingTrend = (customerId, months = 6) =>
 export const predictLoan = (payload) =>
   client.post("/loans/predict", payload).then((r) => r.data);
 
+export const getLoanHistory = (customerId, limit = 20) =>
+  client.get(`/loans/history/${customerId}`, { params: { limit } }).then((r) => r.data);
+
 // ── Recommendations ───────────────────────────────────────────────────────────
 
 export const getRecommendations = (customerId) =>
@@ -84,6 +86,7 @@ export const addEntry = (customerId, payload) =>
 export const listEntries = (customerId, params = {}) =>
   client.get(`/entries/${customerId}`, { params }).then((r) => r.data);
 
+// Returns { deleted: true, new_credit_score: N } — no longer 204 No Content
 export const deleteEntry = (customerId, entryId) =>
   client.delete(`/entries/${customerId}/${entryId}`).then((r) => r.data);
 
@@ -109,6 +112,8 @@ export const calculateBankEligibility = (payload) =>
 export const getActivity = (customerId, limit = 20) =>
   client.get(`/activity/${customerId}`, { params: { limit } }).then((r) => r.data);
 
+// ── Admin ─────────────────────────────────────────────────────────────────────
+
 export const getLoanPortfolio = (params = {}) =>
   client.get("/admin/loan-portfolio", { params }).then((r) => r.data);
 
@@ -129,3 +134,7 @@ export const getMarketingProspects = (params = {}) =>
 
 export const getModelMetrics = () =>
   client.get("/admin/model-metrics").then((r) => r.data);
+
+// Admin-only: permanently delete a user and all their data
+export const deleteUser = (customerId) =>
+  client.delete(`/admin/users/${customerId}`).then((r) => r.data);

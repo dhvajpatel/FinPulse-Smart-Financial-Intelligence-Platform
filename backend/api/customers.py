@@ -82,7 +82,7 @@ def customer_loan_profile(customer_id: str, db: Session = Depends(get_db)):
         "monthly_income": round(income, 2),
         "credit_score": customer.credit_score or 650,
         "employment_years": customer.employment_years or 0.0,
-        "existing_debt": 0.0,  # user enters this manually in the loan form
+        "existing_debt": customer.existing_debt or 0.0,
     }
 
 
@@ -131,6 +131,7 @@ def get_customer(customer_id: str, db: Session = Depends(get_db)):
         "monthly_income": customer.monthly_income,
         "credit_score": customer.credit_score,
         "employment_years": customer.employment_years,
+        "existing_debt": customer.existing_debt or 0.0,
         "city": customer.city,
         "risk_band": _risk_band(customer.credit_score),
         "dob": customer.dob,
@@ -187,6 +188,7 @@ def update_profile(
         "monthly_income": customer.monthly_income,
         "credit_score": customer.credit_score,
         "employment_years": customer.employment_years,
+        "existing_debt": customer.existing_debt or 0.0,
         "city": customer.city,
         "risk_band": _risk_band(customer.credit_score),
         "dob": customer.dob,

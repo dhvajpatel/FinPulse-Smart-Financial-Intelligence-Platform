@@ -1,21 +1,33 @@
 import os
 
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, event
 from sqlalchemy.orm import sessionmaker, declarative_base
 
-# Use PostgreSQL only when DATABASE_URL is explicitly provided.
-# Otherwise use local SQLite.
+# Use PostgreSQL when DATABASE_URL is set (Render/Neon production).
+# Fall back to local SQLite for development.
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./smartbank.db")
+
+# Render's Postgres URL starts with "postgres://" — SQLAlchemy needs "postgresql://"
+if DATABASE_URL.startswith("postgres://"):
+    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
 
 if DATABASE_URL.startswith("sqlite"):
     connect_args = {"check_same_thread": False}
+    engine = create_engine(DATABASE_URL, connect_args=connect_args)
+    # Enable WAL mode for SQLite — prevents reader/writer contention
+    @event.listens_for(engine, "connect")
+    def set_wal(dbapi_conn, _):
+        dbapi_conn.execute("PRAGMA journal_mode=WAL")
+        dbapi_conn.execute("PRAGMA synchronous=NORMAL")
 else:
-    connect_args = {}
-
-engine = create_engine(
-    DATABASE_URL,
-    connect_args=connect_args,
-)
+    # PostgreSQL — use a small connection pool suitable for Render free tier
+    engine = create_engine(
+        DATABASE_URL,
+        pool_size=5,
+        max_overflow=10,
+        pool_pre_ping=True,     # drops stale connections automatically
+        pool_recycle=300,       # recycle connections every 5 min
+    )
 
 SessionLocal = sessionmaker(
     autocommit=False,
@@ -30,5 +42,8 @@ def get_db():
     db = SessionLocal()
     try:
         yield db
+    except Exception:
+        db.rollback()
+        raise
     finally:
         db.close()

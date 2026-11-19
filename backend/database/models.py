@@ -1,4 +1,4 @@
-from sqlalchemy import Column, String, Integer, Float, ForeignKey, Text, Boolean
+from sqlalchemy import Column, String, Integer, Float, ForeignKey, Text, Boolean, Index
 from .connection import Base
 
 
@@ -35,6 +35,7 @@ class Customer(Base):
     village = Column(String, nullable=True)
     pan_number = Column(String, nullable=True)
     aadhaar_last4 = Column(String, nullable=True)
+    existing_debt = Column(Float, nullable=True, default=0.0)  # user-reported outstanding debt
 
 
 class DailyEntry(Base):
@@ -49,6 +50,11 @@ class DailyEntry(Base):
     payment_method = Column(String, nullable=True)  # Cash / UPI / Credit Card / Debit Card / Net Banking / Other
     note = Column(Text, nullable=True)
     created_at = Column(String)
+
+
+# ── Composite indexes for fast per-customer queries ──────────────────────────
+Index("ix_de_cust_date",  "daily_entries.customer_id", "daily_entries.entry_date")
+Index("ix_de_cust_type",  "daily_entries.customer_id", "daily_entries.entry_type")
 
 
 class LoanPrediction(Base):

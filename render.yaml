@@ -5,10 +5,13 @@ services:
     region: oregon
     plan: free
     rootDir: backend
-    # Install dependencies and initialise the database schema (no CSV seeding)
     buildCommand: pip install -r requirements.txt && python load_data.py
-    # Launch FastAPI
     startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
     envVars:
       - key: PYTHON_VERSION
         value: "3.11.0"
+      # Set DATABASE_URL to your Neon/Supabase/Render Postgres connection string
+      # to persist all user data across deploys and restarts.
+      # Format: postgresql://user:password@host/dbname?sslmode=require
+      - key: DATABASE_URL
+        sync: false   # fill this in the Render dashboard — never commit secrets

@@ -64,6 +64,7 @@ class ProfileUpdate(BaseModel):
     monthly_income: Optional[float] = None
     credit_score: Optional[int] = None
     employment_years: Optional[float] = None
+    existing_debt: Optional[float] = None   # outstanding debt in ₹
     state: Optional[str] = None
     district: Optional[str] = None
     city: Optional[str] = None

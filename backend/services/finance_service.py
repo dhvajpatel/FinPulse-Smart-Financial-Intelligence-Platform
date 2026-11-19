@@ -64,8 +64,8 @@ def get_financial_health(db: Session, customer_id: str):
 
     savings_ratio = savings / income if income else 0.0
 
-    # Debt comes from profile field (user sets it manually)
-    existing_debt = 0.0  # no synthetic loans table — user can set via profile/loan form
+    # Read existing_debt from customer profile (set via profile update or loan form)
+    existing_debt = float(customer.existing_debt or 0.0) if hasattr(customer, "existing_debt") else 0.0
     dti = existing_debt / income if income else 0.0
 
     emp_years = customer.employment_years or 0.0

@@ -195,7 +195,7 @@ def list_categories():
 
 # ── CRUD ──────────────────────────────────────────────────────────────────────
 
-@router.post("/{customer_id}", response_model=DailyEntryOut, status_code=201)
+@router.post("/{customer_id}", status_code=201)
 def add_entry(
     customer_id: str,
     body: DailyEntryCreate,
@@ -237,7 +237,20 @@ def add_entry(
 
     db.commit()
     db.refresh(entry)
-    return entry
+
+    # Return entry + updated credit score so frontend can update immediately
+    return {
+        "id":             entry.id,
+        "customer_id":    entry.customer_id,
+        "entry_date":     entry.entry_date,
+        "entry_type":     entry.entry_type,
+        "category":       entry.category,
+        "amount":         entry.amount,
+        "payment_method": entry.payment_method,
+        "note":           entry.note,
+        "created_at":     entry.created_at,
+        "new_credit_score": new_score,
+    }
 
 
 @router.get("/{customer_id}", response_model=None)
@@ -293,13 +306,13 @@ def list_entries(
     }
 
 
-@router.delete("/{customer_id}/{entry_id}", status_code=204)
+@router.delete("/{customer_id}/{entry_id}", status_code=200)
 def delete_entry(
     customer_id: str,
     entry_id: int,
     db: Session = Depends(get_db),
 ):
-    """Delete a single entry and recompute credit score."""
+    """Delete a single entry and recompute credit score. Returns updated score."""
     customer = _customer_or_404(db, customer_id)
     entry = (
         db.query(models.DailyEntry)
@@ -316,6 +329,7 @@ def delete_entry(
     customer.credit_score = new_score
 
     db.commit()
+    return {"deleted": True, "new_credit_score": new_score}
 
 
 # ── Summary / Analytics ───────────────────────────────────────────────────────
@@ -329,13 +343,26 @@ def monthly_summary(
     """Returns last N months of aggregated income / expense / savings."""
     _customer_or_404(db, customer_id)
 
+    # Compute cutoff date in SQL so we never load more data than needed
+    from datetime import date
+    today = date.today()
+    cutoff_month = today.month - months
+    cutoff_year = today.year
+    while cutoff_month <= 0:
+        cutoff_month += 12
+        cutoff_year -= 1
+    cutoff = f"{cutoff_year:04d}-{cutoff_month:02d}-01"
+
     rows = (
         db.query(
             func.substr(models.DailyEntry.entry_date, 1, 7).label("month"),
             models.DailyEntry.entry_type,
             func.sum(models.DailyEntry.amount).label("total"),
         )
-        .filter_by(customer_id=customer_id)
+        .filter(
+            models.DailyEntry.customer_id == customer_id,
+            models.DailyEntry.entry_date >= cutoff,
+        )
         .group_by("month", models.DailyEntry.entry_type)
         .order_by("month")
         .all()
@@ -347,8 +374,7 @@ def monthly_summary(
             month_map[month] = {"month": month, "income": 0.0, "expense": 0.0, "savings": 0.0}
         month_map[month][etype] = round(float(total), 2)
 
-    sorted_months = sorted(month_map.values(), key=lambda x: x["month"])
-    result = sorted_months[-months:] if len(sorted_months) > months else sorted_months
+    result = sorted(month_map.values(), key=lambda x: x["month"])
 
     total_income  = sum(m["income"]  for m in result)
     total_expense = sum(m["expense"] for m in result)
