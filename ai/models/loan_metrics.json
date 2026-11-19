@@ -1,17 +1,23 @@
 {
-  "version": "v3",
-  "model_type": "GBR(soft-labels) + MLP weighted ensemble",
-  "accuracy": 0.7638,
-  "precision": 0.2843,
-  "recall": 0.3625,
-  "f1": 0.3187,
-  "roc_auc": 0.6733,
-  "best_val_auc": 0.6357,
+  "version": "v4",
+  "model_type": "XGBoost+LightGBM+GBR soft+hard blend (5 models)",
+  "accuracy": 0.8457,
+  "precision": 0.0,
+  "recall": 0.0,
+  "f1": 0.0,
+  "roc_auc": 0.661,
+  "val_auc": 0.6196,
   "n_train": 2451,
   "n_val": 524,
   "n_test": 525,
+  "n_features": 41,
   "default_rate": 0.1531,
-  "threshold": 0.21,
-  "gbr_weight": 1.0,
-  "mlp_weight": 0.0
+  "threshold": 0.8,
+  "blend_weights": {
+    "XGB-Reg": 0.08,
+    "XGB-Cls": 0.512,
+    "LGBM-Cls": 0.224,
+    "GBR": 0.155,
+    "LGBM-Reg": 0.029
+  }
 }

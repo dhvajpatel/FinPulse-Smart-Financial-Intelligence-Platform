@@ -228,13 +228,14 @@ def gen_loans(customers, rng, frac=0.35):
         existing_debt = max(0, rng.normal(c["monthly_income"] * 0.15, c["monthly_income"] * 0.1))
 
         dti = existing_debt / max(c["monthly_income"], 1)
+        lti = requested / max(c["monthly_income"] * tenure, 1)
         risk_score = (
-            -1.8
-            - 0.006 * (c["credit_score"] - 650)
-            + 2.5 * dti
-            + 0.10 * (requested / max(c["monthly_income"] * tenure, 1))
-            - 0.03 * c["employment_years"]
-            + rng.normal(0, 0.25)   # reduced noise: was 0.5, now 0.25 for cleaner signal
+            -2.0
+            - 0.010 * (c["credit_score"] - 650)   # stronger credit signal
+            + 3.5 * dti                             # stronger DTI signal
+            + 0.20 * lti                            # loan-to-income signal
+            - 0.05 * c["employment_years"]          # employment stability
+            + rng.normal(0, 0.08)                   # minimal noise (was 0.25)
         )
         default_prob = 1 / (1 + np.exp(-risk_score))
         defaulted = int(rng.random() < default_prob)

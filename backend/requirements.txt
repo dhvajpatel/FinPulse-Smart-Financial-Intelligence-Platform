@@ -6,6 +6,9 @@ pydantic
 pandas
 numpy
 scikit-learn==1.7.2
+xgboost==2.0.3
+lightgbm==4.3.0
+imbalanced-learn==0.14.2
 python-multipart
 python-jose[cryptography]==3.3.0
 bcrypt

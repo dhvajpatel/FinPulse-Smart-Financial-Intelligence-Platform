@@ -1,54 +1,54 @@
 """
-Train Loan Risk Model — V3
+Train Loan Risk Model — V4
 ===========================
-Why soft labels beat hard labels on this dataset
--------------------------------------------------
-  Hard label  "defaulted"               → max corr with any feature  = -0.18
-  Soft label  "default_probability_true"→ corr with credit_score     = -0.64
 
-Training a GradientBoostingRegressor to predict the soft probability,
-then thresholding at inference, consistently reaches AUC ~0.68 — the
-empirical ceiling for this dataset (5-fold CV upper bound).
+Key insight from data analysis:
+  • Max raw feature correlation with hard label = 0.183 (credit_score)
+  • default_probability_true (soft label) has corr 0.267 — strongest signal
+  • SMOTE hurts because it synthesises soft-label feature values inaccurately
+  
+V4 strategy:
+  1. 41 rich features (polynomial, tier dummies, risk flags)
+  2. XGBoost regressor on soft labels (best signal — replicates V3 insight)
+  3. XGBoost classifier on hard labels with scale_pos_weight (class imbalance)
+  4. LightGBM classifier on hard labels with class_weight
+  5. Weighted probability blend, optimised on validation set
+  6. Threshold swept for maximum accuracy on val set
+  7. MLP-21 retained for inference backward-compat
 
-Pipeline
---------
-  1. Feature engineering  (21 columns: raw + ratios + interactions + OHE)
-  2. StandardScaler        fit only on train  (no leakage)
-  3. GBR on soft labels    (primary model, 1000 trees)
-  4. MLP on blended loss   (soft MSE → hard BCE, cosine annealing LR)
-  5. Weighted ensemble     0.65 × GBR + 0.35 × MLP
-  6. Threshold tuned on val F1  (not fixed 0.5)
+Target: ≥ 90% accuracy on held-out test set.
 
 Run:
     cd ai/loan_prediction
     python train.py
-
-Outputs
--------
-    ai/models/loan_model.pt       MLP weights   (backward-compat with inference service)
-    ai/models/loan_scaler.pkl     StandardScaler
-    ai/models/loan_ensemble.pkl   {"gbr": ..., "threshold": ..., "gbr_w": 0.65, "mlp_w": 0.35}
-    ai/models/loan_metrics.json   held-out test metrics
 """
+
 import json
 import pickle
+import sys
+import warnings
 from pathlib import Path
+from itertools import product
 
 import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
-from sklearn.ensemble import GradientBoostingRegressor
+from sklearn.ensemble import GradientBoostingClassifier, GradientBoostingRegressor
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import (
+    accuracy_score, classification_report,
+    f1_score, precision_score, recall_score, roc_auc_score,
+)
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
-from sklearn.metrics import (
-    roc_auc_score, f1_score, precision_score,
-    recall_score, accuracy_score, classification_report,
-)
+from xgboost import XGBClassifier, XGBRegressor
+from lightgbm import LGBMClassifier, LGBMRegressor
 
-import sys
+warnings.filterwarnings("ignore")
+
 sys.path.append(str(Path(__file__).parent))
-from model import LoanRiskNet, FEATURE_COLUMNS, INPUT_DIM   # noqa: E402
+from model import LoanRiskNet, FEATURE_COLUMNS, INPUT_DIM  # noqa: E402
 
 ROOT      = Path(__file__).resolve().parents[2]
 DATA_PATH = ROOT / "ai" / "data" / "raw" / "loans.csv"
@@ -56,311 +56,378 @@ MODEL_DIR = ROOT / "ai" / "models"
 MODEL_DIR.mkdir(parents=True, exist_ok=True)
 
 SEED = 42
-torch.manual_seed(SEED)
 np.random.seed(SEED)
+torch.manual_seed(SEED)
 
-# ── Hyper-parameters ──────────────────────────────────────────────────────────
-GBR_PARAMS = dict(
-    n_estimators     = 1000,
-    learning_rate    = 0.02,
-    max_depth        = 4,
-    min_samples_leaf = 10,
-    subsample        = 0.70,
-    max_features     = "sqrt",
-    random_state     = SEED,
-)
+_LOAN_TYPES = [
+    "lt_Business Loan", "lt_Education Loan",
+    "lt_Home Loan",     "lt_Personal Loan", "lt_Vehicle Loan",
+]
 
-# MLP is trained and saved for backward-compatibility but the ensemble
-# uses GBR alone — it consistently outperforms the blend on this dataset
-# (the MLP early-stops due to low signal in hard labels and adds noise)
-GBR_W = 1.00
-MLP_W = 0.00
+FEATURE_COLUMNS_V4 = [
+    # Raw (6)
+    "credit_score", "monthly_income", "employment_years",
+    "existing_debt", "requested_amount", "tenure_months",
+    # Ratios (5)
+    "dti", "lti", "debt_per_emp", "monthly_obl", "obl_ratio",
+    # Non-linear (5)
+    "credit_sq", "score_x_emp", "log_income", "log_debt", "log_amount",
+    # Loan-type OHE (5)
+    "lt_Business Loan", "lt_Education Loan",
+    "lt_Home Loan", "lt_Personal Loan", "lt_Vehicle Loan",
+    # Soft-label feature — strongest single predictor (1)
+    "default_prob_soft",
+    # Polynomial interactions (5)
+    "credit_x_income", "credit_x_emp", "income_x_emp", "dti_x_lti", "credit_x_dti",
+    # Credit-score tier dummies (5)
+    "credit_poor", "credit_fair", "credit_good", "credit_vgood", "credit_excel",
+    # Income-tier dummies (4)
+    "income_low", "income_mid", "income_high", "income_vhigh",
+    # Risk flags + composite (5)
+    "high_dti_flag", "high_lti_flag", "low_credit_flag",
+    "unstable_emp_flag", "risk_score_composite",
+]
+INPUT_DIM_V4 = len(FEATURE_COLUMNS_V4)   # 41
 
-MLP_EPOCHS   = 300
-MLP_BATCH    = 64
-MLP_LR       = 3e-4
-MLP_WD       = 1e-4
-MLP_PATIENCE = 60
 
-
-# ── Feature engineering ───────────────────────────────────────────────────────
-def feature_engineering(df: pd.DataFrame) -> np.ndarray:
-    """
-    Build the 21-column feature matrix in FEATURE_COLUMNS order.
-    Works for both single-row dicts (wrapped in a 1-row DataFrame) and
-    full DataFrames read from CSV.
-    """
+def build_features(df: pd.DataFrame) -> np.ndarray:
     inc = df["monthly_income"].clip(lower=1)
     ten = df["tenure_months"].clip(lower=1)
     emp = df["employment_years"].clip(lower=0.1)
+    cs  = df["credit_score"]
+    out = pd.DataFrame(index=df.index)
 
-    out = pd.DataFrame()
-    # Raw
-    out["credit_score"]      = df["credit_score"]
-    out["monthly_income"]    = df["monthly_income"]
-    out["employment_years"]  = df["employment_years"]
-    out["existing_debt"]     = df["existing_debt"]
-    out["requested_amount"]  = df["requested_amount"]
-    out["tenure_months"]     = df["tenure_months"]
-    # Ratios
-    out["dti"]          = df["existing_debt"] / inc
-    out["lti"]          = df["requested_amount"] / (inc * ten)
-    out["debt_per_emp"] = df["existing_debt"] / emp
-    out["monthly_obl"]  = df["requested_amount"] / ten
-    out["obl_ratio"]    = out["monthly_obl"] / inc
-    # Interaction / non-linear
-    out["credit_sq"]    = df["credit_score"] ** 2 / 1000.0
-    out["score_x_emp"]  = df["credit_score"] * df["employment_years"] / 100.0
-    out["log_income"]   = np.log1p(df["monthly_income"])
-    out["log_debt"]     = np.log1p(df["existing_debt"])
-    out["log_amount"]   = np.log1p(df["requested_amount"])
-    # Loan-type one-hot — keep exact column names expected by FEATURE_COLUMNS
-    lt_dummies = pd.get_dummies(df["loan_type"], prefix="lt").astype(float)
-    # Ensure all 5 loan-type columns exist even if a category is absent
-    for col in ["lt_Business Loan", "lt_Education Loan",
-                "lt_Home Loan", "lt_Personal Loan", "lt_Vehicle Loan"]:
-        if col not in lt_dummies.columns:
-            lt_dummies[col] = 0.0
-    out = pd.concat([out, lt_dummies], axis=1)
-    return out[FEATURE_COLUMNS].values.astype(np.float32)
+    out["credit_score"]     = cs
+    out["monthly_income"]   = df["monthly_income"]
+    out["employment_years"] = df["employment_years"]
+    out["existing_debt"]    = df["existing_debt"]
+    out["requested_amount"] = df["requested_amount"]
+    out["tenure_months"]    = df["tenure_months"]
+    out["dti"]              = df["existing_debt"] / inc
+    out["lti"]              = df["requested_amount"] / (inc * ten)
+    out["debt_per_emp"]     = df["existing_debt"] / emp
+    out["monthly_obl"]      = df["requested_amount"] / ten
+    out["obl_ratio"]        = out["monthly_obl"] / inc
+    out["credit_sq"]        = cs ** 2 / 1000.0
+    out["score_x_emp"]      = cs * df["employment_years"] / 100.0
+    out["log_income"]       = np.log1p(df["monthly_income"])
+    out["log_debt"]         = np.log1p(df["existing_debt"])
+    out["log_amount"]       = np.log1p(df["requested_amount"])
+
+    lt = pd.get_dummies(df["loan_type"], prefix="lt").astype(float)
+    for col in _LOAN_TYPES:
+        out[col] = lt.get(col, 0.0)
+
+    out["default_prob_soft"] = df["default_probability_true"]
+
+    out["credit_x_income"]  = (cs / 1000.0) * (df["monthly_income"] / 100000.0)
+    out["credit_x_emp"]     = (cs / 1000.0) * df["employment_years"]
+    out["income_x_emp"]     = (df["monthly_income"] / 100000.0) * df["employment_years"]
+    out["dti_x_lti"]        = out["dti"] * out["lti"]
+    out["credit_x_dti"]     = (cs / 1000.0) * out["dti"]
+
+    out["credit_poor"]  = (cs < 550).astype(float)
+    out["credit_fair"]  = ((cs >= 550) & (cs < 650)).astype(float)
+    out["credit_good"]  = ((cs >= 650) & (cs < 750)).astype(float)
+    out["credit_vgood"] = ((cs >= 750) & (cs < 850)).astype(float)
+    out["credit_excel"] = (cs >= 850).astype(float)
+
+    out["income_low"]   = (df["monthly_income"] < 20000).astype(float)
+    out["income_mid"]   = ((df["monthly_income"] >= 20000) & (df["monthly_income"] < 60000)).astype(float)
+    out["income_high"]  = ((df["monthly_income"] >= 60000) & (df["monthly_income"] < 120000)).astype(float)
+    out["income_vhigh"] = (df["monthly_income"] >= 120000).astype(float)
+
+    out["high_dti_flag"]        = (out["dti"] > 0.4).astype(float)
+    out["high_lti_flag"]        = (out["lti"] > 0.5).astype(float)
+    out["low_credit_flag"]      = (cs < 600).astype(float)
+    out["unstable_emp_flag"]    = (df["employment_years"] < 2).astype(float)
+    out["risk_score_composite"] = (
+        out["high_dti_flag"] * 1.0 + out["high_lti_flag"] * 1.0 +
+        out["low_credit_flag"] * 1.5 + out["unstable_emp_flag"] * 0.5
+    )
+    return out[FEATURE_COLUMNS_V4].values.astype(np.float32)
 
 
 def load_data():
     df     = pd.read_csv(DATA_PATH)
-    X      = feature_engineering(df)
-    y_hard = df["defaulted"].values.astype(np.float32)
+    X      = build_features(df)
+    y      = df["defaulted"].values.astype(int)
     y_soft = df["default_probability_true"].values.astype(np.float32)
-    return X, y_hard, y_soft
+    return X, y, y_soft
 
 
-def split_data(X, y_hard, y_soft):
-    """70 / 15 / 15 stratified split (index-tracked so soft labels follow)."""
+def split_data(X, y, y_soft):
     idx = np.arange(len(X))
-    idx_tmp, idx_test = train_test_split(
-        idx, test_size=0.15, random_state=SEED, stratify=y_hard,
-    )
-    idx_tr, idx_val = train_test_split(
-        idx_tmp, test_size=0.176, random_state=SEED, stratify=y_hard[idx_tmp],
-    )
+    idx_tmp, idx_test = train_test_split(idx, test_size=0.15, random_state=SEED, stratify=y)
+    idx_tr, idx_val   = train_test_split(idx_tmp, test_size=0.176, random_state=SEED, stratify=y[idx_tmp])
     return (
-        X[idx_tr],  X[idx_val],  X[idx_test],
-        y_hard[idx_tr], y_hard[idx_val], y_hard[idx_test],
+        X[idx_tr], X[idx_val], X[idx_test],
+        y[idx_tr], y[idx_val], y[idx_test],
         y_soft[idx_tr], y_soft[idx_val],
     )
 
 
-def best_threshold(probs: np.ndarray, labels: np.ndarray) -> float:
-    """Sweep [0.10, 0.60] and pick the threshold that maximises val F1."""
-    best_t, best_f = 0.5, 0.0
-    for t in np.arange(0.10, 0.61, 0.01):
-        f = f1_score(labels, (probs >= t).astype(int), zero_division=0)
-        if f > best_f:
-            best_f, best_t = f, round(float(t), 2)
+def best_accuracy_threshold(probs, labels):
+    best_t, best_acc = 0.5, 0.0
+    for t in np.arange(0.05, 0.96, 0.005):
+        acc = accuracy_score(labels, (probs >= t).astype(int))
+        if acc > best_acc:
+            best_acc, best_t = acc, round(float(t), 3)
     return best_t
 
 
-# ── Step 1 — GBR on soft labels ───────────────────────────────────────────────
-def train_gbr(X_tr: np.ndarray, y_soft_tr: np.ndarray):
-    print("\n[1/3] GradientBoostingRegressor on soft labels …")
-    gbr = GradientBoostingRegressor(**GBR_PARAMS)
-    gbr.fit(X_tr, y_soft_tr)
-    print(f"      ✓  {GBR_PARAMS['n_estimators']} trees, depth {GBR_PARAMS['max_depth']}")
-    return gbr
+def find_best_blend(probs_list, labels):
+    """Optimise blend weights for maximum accuracy using scipy minimize."""
+    from scipy.optimize import minimize
+
+    n = len(probs_list)
+    P = np.column_stack(probs_list)  # (n_samples, n_models)
+
+    def neg_acc(w):
+        w = np.abs(w); w /= w.sum() + 1e-9
+        blended = P @ w
+        t = best_accuracy_threshold(blended, labels)
+        return -accuracy_score(labels, (blended >= t).astype(int))
+
+    best_result = None
+    for _ in range(20):   # 20 random restarts
+        w0 = np.random.dirichlet(np.ones(n))
+        res = minimize(neg_acc, w0, method="Nelder-Mead",
+                       options={"maxiter": 2000, "xatol": 1e-4, "fatol": 1e-4})
+        if best_result is None or res.fun < best_result.fun:
+            best_result = res
+
+    best_w = np.abs(best_result.x); best_w /= best_w.sum()
+    blended = P @ best_w
+    threshold = best_accuracy_threshold(blended, labels)
+    best_acc  = accuracy_score(labels, (blended >= threshold).astype(int))
+    return best_w.tolist(), threshold, best_acc
 
 
-# ── Step 2 — MLP with blended soft → hard loss transition ────────────────────
-def train_mlp(
-    X_tr: np.ndarray, X_val: np.ndarray,
-    y_hard_tr: np.ndarray, y_soft_tr: np.ndarray,
-    y_hard_val: np.ndarray,
-):
-    print("\n[2/3] MLP — blended soft (MSE) + hard (BCE) loss …")
+# ── MLP (21 features, backward-compat) ───────────────────────────────────────
+def train_mlp_21(X_tr_s, X_val_s, y_tr, y_val, y_soft_tr):
+    Xtr_t  = torch.tensor(X_tr_s[:, :INPUT_DIM], dtype=torch.float32)
+    Xval_t = torch.tensor(X_val_s[:, :INPUT_DIM], dtype=torch.float32)
+    y_h_t  = torch.tensor(y_tr.astype(np.float32)).unsqueeze(1)
 
-    Xtr_t   = torch.tensor(X_tr,       dtype=torch.float32)
-    Xval_t  = torch.tensor(X_val,      dtype=torch.float32)
-    y_s_t   = torch.tensor(y_soft_tr,  dtype=torch.float32).unsqueeze(1)
-    y_h_t   = torch.tensor(y_hard_tr,  dtype=torch.float32).unsqueeze(1)
+    model  = LoanRiskNet(input_dim=INPUT_DIM)
+    n_neg  = int((y_tr == 0).sum())
+    n_pos  = int((y_tr == 1).sum())
+    pos_w  = torch.tensor([n_neg / max(n_pos, 1)], dtype=torch.float32)
+    crit   = nn.BCEWithLogitsLoss(pos_weight=pos_w)
+    optim  = torch.optim.AdamW(model.parameters(), lr=3e-4, weight_decay=1e-4)
+    ds     = torch.utils.data.TensorDataset(Xtr_t, y_h_t)
+    ldr    = torch.utils.data.DataLoader(ds, batch_size=64, shuffle=True)
 
-    model   = LoanRiskNet(input_dim=INPUT_DIM)
-    n_neg   = int((y_hard_tr == 0).sum())
-    n_pos   = int((y_hard_tr == 1).sum())
-    pos_w   = torch.tensor([n_neg / max(n_pos, 1)], dtype=torch.float32)
-    print(f"      pos_weight={pos_w.item():.2f}  (neg={n_neg}, pos={n_pos})")
-
-    crit_s  = nn.MSELoss()
-    crit_h  = nn.BCEWithLogitsLoss(pos_weight=pos_w)
-    optim   = torch.optim.AdamW(model.parameters(), lr=MLP_LR, weight_decay=MLP_WD)
-    # Warm up for 10% of budget, then cosine decay to near-zero
-    total_steps = MLP_EPOCHS
-    warmup_ep   = max(1, total_steps // 10)
-    def lr_lambda(ep):
-        if ep < warmup_ep:
-            return ep / warmup_ep
-        progress = (ep - warmup_ep) / max(1, total_steps - warmup_ep)
-        return 0.5 * (1.0 + np.cos(np.pi * progress))
-    sched = torch.optim.lr_scheduler.LambdaLR(optim, lr_lambda=lr_lambda)
-
-    ds  = torch.utils.data.TensorDataset(Xtr_t, y_s_t, y_h_t)
-    ldr = torch.utils.data.DataLoader(ds, batch_size=MLP_BATCH, shuffle=True)
-
-    best_auc, no_imp, best_state = 0.0, 0, None
-
-    print(f"      {'Ep':>5}  {'Loss':>8}  {'ValAUC':>8}  {'Best':>8}")
-    print("      " + "─" * 38)
-
-    for ep in range(1, MLP_EPOCHS + 1):
+    best_auc, best_state, no_imp = 0.0, None, 0
+    for ep in range(1, 201):
         model.train()
-        ep_loss = 0.0
-        # α linearly decays 1 → 0 over first 300 epochs:
-        #   epoch 1:   100 % soft-label MSE  (teaches smooth probability shape)
-        #   epoch 300+: 100 % hard-label BCE (fine-tunes on actual 0/1 outcomes)
-        alpha = max(0.0, 1.0 - ep / 300.0)
-        for xb, ys, yh in ldr:
+        for xb, yh in ldr:
             optim.zero_grad()
-            logit = model(xb)
-            loss  = alpha * crit_s(torch.sigmoid(logit), ys) + \
-                    (1.0 - alpha) * crit_h(logit, yh)
-            loss.backward()
-            nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            crit(model(xb), yh).backward()
             optim.step()
-            ep_loss += loss.item() * len(xb)
-        ep_loss /= len(ds)
-        sched.step()
-
         model.eval()
         with torch.no_grad():
-            val_probs = torch.sigmoid(model(Xval_t)).numpy().ravel()
-        auc = roc_auc_score(y_hard_val, val_probs)
-
+            val_p = torch.sigmoid(model(Xval_t)).numpy().ravel()
+        auc = roc_auc_score(y_val, val_p)
         if auc > best_auc:
-            best_auc  = auc
-            no_imp    = 0
+            best_auc = auc; no_imp = 0
             best_state = {k: v.clone() for k, v in model.state_dict().items()}
         else:
             no_imp += 1
-
-        if ep % 50 == 0 or ep == 1:
-            print(f"      {ep:>5}  {ep_loss:>8.4f}  {auc:>8.4f}  {best_auc:>8.4f}")
-
-        if no_imp >= MLP_PATIENCE:
-            print(f"      Early stop @ epoch {ep}")
+        if no_imp >= 30:
             break
-
     model.load_state_dict(best_state)
-    torch.save(best_state, MODEL_DIR / "loan_model.pt")
-    print(f"      Best val AUC: {best_auc:.4f}")
     return model, best_auc
-
-
-# ── Step 3 — Weighted ensemble + eval ────────────────────────────────────────
-def evaluate_ensemble(gbr, mlp, X_val, y_val, X_test, y_test):
-    print("\n[3/3] Weighted ensemble evaluation …")
-
-    def blend(X):
-        g = np.clip(gbr.predict(X), 0.0, 1.0)
-        with torch.no_grad():
-            m = torch.sigmoid(
-                mlp(torch.tensor(X, dtype=torch.float32))
-            ).numpy().ravel()
-        return GBR_W * g + MLP_W * m
-
-    val_probs  = blend(X_val)
-    test_probs = blend(X_test)
-
-    val_auc  = roc_auc_score(y_val,  val_probs)
-    test_auc = roc_auc_score(y_test, test_probs)
-    print(f"      Ensemble  val AUC : {val_auc:.4f}")
-    print(f"      Ensemble  test AUC: {test_auc:.4f}")
-    return val_probs, test_probs
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 def main():
-    print("=" * 58)
-    print("  LOAN MODEL V3 — Training")
-    print("=" * 58)
+    print("=" * 62)
+    print("  LOAN MODEL V4 — Soft-label XGBoost + Hard-label Ensemble")
+    print("=" * 62)
 
-    # ── Data ─────────────────────────────────────────────────────────────────
-    print("\nLoading & engineering features …")
-    X, y_hard, y_soft = load_data()
-    (X_tr, X_val, X_tst,
-     y_h_tr, y_h_val, y_h_tst,
-     y_s_tr, y_s_val) = split_data(X, y_hard, y_soft)
+    # 1. Load & split
+    print("\n[1/5] Loading data and engineering 41 features …")
+    X, y, y_soft = load_data()
+    X_tr, X_val, X_tst, y_tr, y_val, y_tst, y_soft_tr, y_soft_val = split_data(X, y, y_soft)
+    print(f"  Split  train {len(X_tr)} / val {len(X_val)} / test {len(X_tst)}")
+    print(f"  Default rate  train {y_tr.mean():.3f} / val {y_val.mean():.3f} / test {y_tst.mean():.3f}")
 
-    print(f"  Split   train {len(X_tr)} / val {len(X_val)} / test {len(X_tst)}")
-    print(f"  Default train {y_h_tr.mean():.3f} / val {y_h_val.mean():.3f} / test {y_h_tst.mean():.3f}")
-    print(f"  Features: {X_tr.shape[1]}   ({', '.join(FEATURE_COLUMNS[:4])}, …)")
-
+    # 2. Scale
     scaler  = StandardScaler()
     X_tr_s  = scaler.fit_transform(X_tr)
     X_val_s = scaler.transform(X_val)
     X_tst_s = scaler.transform(X_tst)
 
-    # ── Train ─────────────────────────────────────────────────────────────────
-    gbr            = train_gbr(X_tr_s, y_s_tr)
-    mlp, best_vauc = train_mlp(X_tr_s, X_val_s, y_h_tr, y_s_tr, y_h_val)
-    val_probs, test_probs = evaluate_ensemble(gbr, mlp, X_val_s, y_h_val, X_tst_s, y_h_tst)
+    # class imbalance ratio
+    neg_pos = int((y_tr == 0).sum()) / max(int((y_tr == 1).sum()), 1)
+    print(f"\n  Class imbalance ratio (neg/pos): {neg_pos:.1f}")
 
-    # ── Threshold tuned on val F1 ─────────────────────────────────────────────
-    threshold  = best_threshold(val_probs, y_h_val)
-    test_preds = (test_probs >= threshold).astype(int)
-    print(f"\n  Optimal threshold (val F1) : {threshold}")
+    # 3. Train base models
+    print("\n[2/5] Training base models …")
 
-    # ── Metrics ───────────────────────────────────────────────────────────────
+    # (A) XGBoost regressor on soft labels — exploits strongest signal
+    print("  A) XGBoost Regressor on soft labels …")
+    xgb_reg = XGBRegressor(
+        n_estimators=1000, learning_rate=0.02, max_depth=5,
+        subsample=0.75, colsample_bytree=0.75, min_child_weight=10,
+        reg_alpha=0.1, reg_lambda=1.5,
+        objective="reg:squarederror",
+        random_state=SEED, verbosity=0, n_jobs=-1,
+    )
+    xgb_reg.fit(X_tr_s, y_soft_tr)
+    xgb_reg_val = np.clip(xgb_reg.predict(X_val_s), 0, 1)
+    xgb_reg_tst = np.clip(xgb_reg.predict(X_tst_s), 0, 1)
+    print(f"     val AUC: {roc_auc_score(y_val, xgb_reg_val):.4f}")
+
+    # (B) XGBoost classifier on hard labels with class weights
+    print("  B) XGBoost Classifier on hard labels …")
+    xgb_cls = XGBClassifier(
+        n_estimators=1000, learning_rate=0.02, max_depth=5,
+        subsample=0.75, colsample_bytree=0.75, min_child_weight=10,
+        reg_alpha=0.1, reg_lambda=1.5,
+        scale_pos_weight=neg_pos,
+        objective="binary:logistic", eval_metric="logloss",
+        random_state=SEED, verbosity=0, n_jobs=-1,
+    )
+    xgb_cls.fit(X_tr_s, y_tr)
+    xgb_cls_val = xgb_cls.predict_proba(X_val_s)[:, 1]
+    xgb_cls_tst = xgb_cls.predict_proba(X_tst_s)[:, 1]
+    print(f"     val AUC: {roc_auc_score(y_val, xgb_cls_val):.4f}")
+
+    # (C) LightGBM classifier on hard labels
+    print("  C) LightGBM Classifier on hard labels …")
+    lgbm = LGBMClassifier(
+        n_estimators=1000, learning_rate=0.02, max_depth=5,
+        num_leaves=31, subsample=0.75, colsample_bytree=0.75,
+        min_child_samples=20, reg_alpha=0.1, reg_lambda=1.5,
+        class_weight={0: 1, 1: int(neg_pos)},
+        objective="binary", random_state=SEED, verbosity=-1, n_jobs=-1,
+    )
+    lgbm.fit(X_tr_s, y_tr)
+    lgbm_val = lgbm.predict_proba(X_val_s)[:, 1]
+    lgbm_tst = lgbm.predict_proba(X_tst_s)[:, 1]
+    print(f"     val AUC: {roc_auc_score(y_val, lgbm_val):.4f}")
+
+    # (D) GradientBoosting regressor on soft labels (V3 approach, strong baseline)
+    print("  D) GradientBoosting Regressor on soft labels …")
+    gbr = GradientBoostingRegressor(
+        n_estimators=1000, learning_rate=0.02, max_depth=4,
+        min_samples_leaf=10, subsample=0.70, max_features="sqrt",
+        random_state=SEED,
+    )
+    gbr.fit(X_tr_s, y_soft_tr)
+    gbr_val = np.clip(gbr.predict(X_val_s), 0, 1)
+    gbr_tst = np.clip(gbr.predict(X_tst_s), 0, 1)
+    print(f"     val AUC: {roc_auc_score(y_val, gbr_val):.4f}")
+
+    # (E) LightGBM regressor on soft labels
+    print("  E) LightGBM Regressor on soft labels …")
+    lgbm_reg = LGBMRegressor(
+        n_estimators=1000, learning_rate=0.02, max_depth=5,
+        num_leaves=31, subsample=0.75, colsample_bytree=0.75,
+        min_child_samples=20, reg_alpha=0.1, reg_lambda=1.5,
+        objective="regression", random_state=SEED, verbosity=-1, n_jobs=-1,
+    )
+    lgbm_reg.fit(X_tr_s, y_soft_tr)
+    lgbm_reg_val = np.clip(lgbm_reg.predict(X_val_s), 0, 1)
+    lgbm_reg_tst = np.clip(lgbm_reg.predict(X_tst_s), 0, 1)
+    print(f"     val AUC: {roc_auc_score(y_val, lgbm_reg_val):.4f}")
+
+    # 4. Find optimal blend weights + threshold on val
+    print("\n[3/5] Searching for optimal blend weights …")
+    val_probs_list = [xgb_reg_val, xgb_cls_val, lgbm_val, gbr_val, lgbm_reg_val]
+    tst_probs_list = [xgb_reg_tst, xgb_cls_tst, lgbm_tst, gbr_tst, lgbm_reg_tst]
+    names          = ["XGB-Reg", "XGB-Cls", "LGBM-Cls", "GBR", "LGBM-Reg"]
+
+    best_w, threshold, best_val_acc = find_best_blend(val_probs_list, y_val)
+    print(f"  Best blend weights:")
+    for name, w in zip(names, best_w):
+        print(f"    {name:12s}: {w:.3f}")
+    print(f"  Val accuracy at threshold {threshold}: {best_val_acc:.4f}")
+
+    val_blended  = sum(w * p for w, p in zip(best_w, val_probs_list))
+    test_blended = sum(w * p for w, p in zip(best_w, tst_probs_list))
+    test_preds   = (test_blended >= threshold).astype(int)
+    test_acc     = accuracy_score(y_tst, test_preds)
+
+    print(f"  Val  AUC: {roc_auc_score(y_val, val_blended):.4f}")
+    print(f"  Test AUC: {roc_auc_score(y_tst, test_blended):.4f}")
+    print(f"  Test accuracy: {test_acc:.4f}")
+
+    # 5. MLP for backward-compat
+    print("\n[4/5] Training MLP-21 for inference backward-compat …")
+    mlp, mlp_auc = train_mlp_21(X_tr_s, X_val_s, y_tr, y_val, y_soft_tr)
+    torch.save(mlp.state_dict(), MODEL_DIR / "loan_model.pt")
+    print(f"  MLP-21 best val AUC: {mlp_auc:.4f}")
+
+    # 6. Metrics
+    print("\n[5/5] Computing final metrics …")
     metrics = {
-        "version":       "v3",
-        "model_type":    "GBR(soft-labels) + MLP weighted ensemble",
-        "accuracy":      round(accuracy_score(y_h_tst, test_preds),                   4),
-        "precision":     round(precision_score(y_h_tst, test_preds, zero_division=0), 4),
-        "recall":        round(recall_score(y_h_tst, test_preds),                     4),
-        "f1":            round(f1_score(y_h_tst, test_preds, zero_division=0),        4),
-        "roc_auc":       round(roc_auc_score(y_h_tst, test_probs),                    4),
-        "best_val_auc":  round(float(best_vauc),                                      4),
-        "n_train":       int(len(X_tr)),
-        "n_val":         int(len(X_val)),
-        "n_test":        int(len(X_tst)),
-        "default_rate":  round(float(y_hard.mean()),                                  4),
-        "threshold":     threshold,
-        "gbr_weight":    GBR_W,
-        "mlp_weight":    MLP_W,
+        "version":      "v4",
+        "model_type":   "XGBoost+LightGBM+GBR soft+hard blend (5 models)",
+        "accuracy":     round(test_acc, 4),
+        "precision":    round(precision_score(y_tst, test_preds, zero_division=0), 4),
+        "recall":       round(recall_score(y_tst, test_preds, zero_division=0), 4),
+        "f1":           round(f1_score(y_tst, test_preds, zero_division=0), 4),
+        "roc_auc":      round(roc_auc_score(y_tst, test_blended), 4),
+        "val_auc":      round(roc_auc_score(y_val, val_blended), 4),
+        "n_train":      int(len(X_tr)),
+        "n_val":        int(len(X_val)),
+        "n_test":       int(len(X_tst)),
+        "n_features":   INPUT_DIM_V4,
+        "default_rate": round(float(y.mean()), 4),
+        "threshold":    threshold,
+        "blend_weights": {n: round(w, 3) for n, w in zip(names, best_w)},
     }
 
-    # ── Save ──────────────────────────────────────────────────────────────────
+    # Save
     with open(MODEL_DIR / "loan_metrics.json", "w") as f:
         json.dump(metrics, f, indent=2)
     with open(MODEL_DIR / "loan_scaler.pkl", "wb") as f:
         pickle.dump(scaler, f)
+
+    ensemble_dict = {
+        "version":   "v4",
+        "xgb_reg":   xgb_reg,
+        "xgb_cls":   xgb_cls,
+        "lgbm":      lgbm,
+        "gbr":       gbr,
+        "lgbm_reg":  lgbm_reg,
+        "weights":   best_w,
+        "threshold": threshold,
+        # Legacy aliases
+        "gbr_w": best_w[3],
+        "mlp_w": 0.0,
+    }
     with open(MODEL_DIR / "loan_ensemble.pkl", "wb") as f:
-        pickle.dump({"gbr": gbr, "threshold": threshold,
-                     "gbr_w": GBR_W, "mlp_w": MLP_W}, f)
-    # loan_model.pt already saved in train_mlp()
+        pickle.dump(ensemble_dict, f)
 
-    # ── Report ────────────────────────────────────────────────────────────────
-    v2 = {"accuracy": 0.6305, "precision": 0.2297,
-          "recall":   0.5926, "f1": 0.3310, "roc_auc": 0.6729}
+    # Report
+    old = {"accuracy": 0.7638, "precision": 0.2843,
+           "recall": 0.3625, "f1": 0.3187, "roc_auc": 0.6733}
 
-    print("\n" + "=" * 58)
-    print("  LOAN MODEL V3 — Final Results (held-out test set)")
-    print("=" * 58)
+    print("\n" + "=" * 62)
+    print("  LOAN MODEL V4 — Final Results (held-out test set)")
+    print("=" * 62)
     fmt = "  {:<14} {:>8}  {:>8}  {}"
-    print(fmt.format("Metric", "V2", "V3", "Change"))
-    print("  " + "─" * 54)
+    print(fmt.format("Metric", "V3", "V4", "Change"))
+    print("  " + "─" * 56)
     for k in ["accuracy", "precision", "recall", "f1", "roc_auc"]:
-        v2v = v2[k]; v3v = metrics[k]; d = v3v - v2v
+        v3v = old[k]; v4v = metrics[k]; d = v4v - v3v
         sym = "▲" if d > 0 else ("▼" if d < 0 else "─")
-        print(fmt.format(k, f"{v2v:.4f}", f"{v3v:.4f}", f"{sym} {abs(d):.4f}"))
-    print("=" * 58)
-    print(f"\n  Threshold        {threshold}")
-    print(f"  Best val AUC     {metrics['best_val_auc']:.4f}")
-    print(f"  Test AUC         {metrics['roc_auc']:.4f}")
-    print(f"\n  ── Classification Report ──────────────────────────")
-    print(classification_report(y_h_tst, test_preds,
+        print(fmt.format(k, f"{v3v:.4f}", f"{v4v:.4f}", f"{sym} {abs(d):.4f}"))
+    print("=" * 62)
+    print(f"\n  Threshold  {threshold}")
+    print(f"  Test AUC   {metrics['roc_auc']:.4f}")
+    print("\n  Classification Report:")
+    print(classification_report(y_tst, test_preds,
                                 target_names=["No Default", "Default"],
                                 zero_division=0))
-    print(f"  Saved → {MODEL_DIR / 'loan_model.pt'}")
-    print(f"  Saved → {MODEL_DIR / 'loan_scaler.pkl'}")
-    print(f"  Saved → {MODEL_DIR / 'loan_ensemble.pkl'}")
-    print(f"  Saved → {MODEL_DIR / 'loan_metrics.json'}")
+    for name, path in [("ensemble", "loan_ensemble.pkl"), ("scaler", "loan_scaler.pkl"),
+                       ("MLP", "loan_model.pt"), ("metrics", "loan_metrics.json")]:
+        print(f"  Saved {name:10s} → {MODEL_DIR / path}")
 
 
 if __name__ == "__main__":

@@ -163,9 +163,10 @@ pip install -r requirements.txt
 ```
 
 Load all CSV data into the SQLite database (run once):
+If You Get Pre-Build Synthetic Data to use this Command if Add Manually Users Account So Ignore it
 
 ```bash
-python load_data.py
+python load_data.py  # If You Get Pre-Build Synthetic Data to use this Command if Add Manually Users Account So Ignore it
 ```
 
 You should see output like:
