@@ -11,6 +11,11 @@ DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./smartbank.db")
 if DATABASE_URL.startswith("postgres://"):
     DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
 
+# Force psycopg2 dialect explicitly — prevents SQLAlchemy 2.x from trying
+# to import psycopg (v3) which is not installed. psycopg2-binary is used instead.
+if DATABASE_URL.startswith("postgresql://"):
+    DATABASE_URL = DATABASE_URL.replace("postgresql://", "postgresql+psycopg2://", 1)
+
 if DATABASE_URL.startswith("sqlite"):
     connect_args = {"check_same_thread": False}
     engine = create_engine(DATABASE_URL, connect_args=connect_args)
