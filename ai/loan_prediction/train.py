@@ -168,40 +168,50 @@ def split_data(X, y, y_soft):
 
 
 def best_accuracy_threshold(probs, labels):
-    best_t, best_acc = 0.5, 0.0
+    """Find threshold that maximises balanced accuracy (mean of per-class recall).
+    Ensures both Default and No-Default classes are properly detected."""
+    from sklearn.metrics import balanced_accuracy_score
+    best_t, best_score = 0.5, 0.0
     for t in np.arange(0.05, 0.96, 0.005):
-        acc = accuracy_score(labels, (probs >= t).astype(int))
-        if acc > best_acc:
-            best_acc, best_t = acc, round(float(t), 3)
+        score = balanced_accuracy_score(labels, (probs >= t).astype(int))
+        if score > best_score:
+            best_score, best_t = score, round(float(t), 3)
     return best_t
 
 
 def find_best_blend(probs_list, labels):
-    """Optimise blend weights for maximum accuracy using scipy minimize."""
-    from scipy.optimize import minimize
+    """Find blend weights + threshold that maximise balanced accuracy.
+    Uses a fast coarse grid (not scipy) to avoid timeouts."""
+    from sklearn.metrics import balanced_accuracy_score
 
     n = len(probs_list)
-    P = np.column_stack(probs_list)  # (n_samples, n_models)
+    P = np.column_stack(probs_list)
 
-    def neg_acc(w):
-        w = np.abs(w); w /= w.sum() + 1e-9
+    best_score, best_w, best_t = 0.0, np.ones(n) / n, 0.3
+
+    # Coarse grid: try a small set of weight combinations
+    weight_sets = []
+    # Equal weight baseline
+    weight_sets.append(np.ones(n) / n)
+    # Single-model baselines
+    for i in range(n):
+        w = np.zeros(n); w[i] = 1.0; weight_sets.append(w)
+    # Soft-label heavy (models 0, 3, 4 are regressors on soft labels)
+    weight_sets.append(np.array([0.4, 0.1, 0.1, 0.3, 0.1]))
+    weight_sets.append(np.array([0.3, 0.2, 0.1, 0.3, 0.1]))
+    weight_sets.append(np.array([0.2, 0.3, 0.2, 0.2, 0.1]))
+    # Hard-label heavy (models 1 and 2 are classifiers on hard labels)
+    weight_sets.append(np.array([0.1, 0.4, 0.3, 0.1, 0.1]))
+    weight_sets.append(np.array([0.1, 0.3, 0.3, 0.2, 0.1]))
+
+    for w in weight_sets:
         blended = P @ w
-        t = best_accuracy_threshold(blended, labels)
-        return -accuracy_score(labels, (blended >= t).astype(int))
+        for t in np.arange(0.10, 0.60, 0.02):
+            score = balanced_accuracy_score(labels, (blended >= t).astype(int))
+            if score > best_score:
+                best_score, best_w, best_t = score, w.copy(), round(float(t), 2)
 
-    best_result = None
-    for _ in range(20):   # 20 random restarts
-        w0 = np.random.dirichlet(np.ones(n))
-        res = minimize(neg_acc, w0, method="Nelder-Mead",
-                       options={"maxiter": 2000, "xatol": 1e-4, "fatol": 1e-4})
-        if best_result is None or res.fun < best_result.fun:
-            best_result = res
-
-    best_w = np.abs(best_result.x); best_w /= best_w.sum()
-    blended = P @ best_w
-    threshold = best_accuracy_threshold(blended, labels)
-    best_acc  = accuracy_score(labels, (blended >= threshold).astype(int))
-    return best_w.tolist(), threshold, best_acc
+    return best_w.tolist(), best_t, best_score
 
 
 # ── MLP (21 features, backward-compat) ───────────────────────────────────────
@@ -352,9 +362,13 @@ def main():
     test_preds   = (test_blended >= threshold).astype(int)
     test_acc     = accuracy_score(y_tst, test_preds)
 
+    from sklearn.metrics import balanced_accuracy_score
+    test_bal_acc = balanced_accuracy_score(y_tst, test_preds)
+
     print(f"  Val  AUC: {roc_auc_score(y_val, val_blended):.4f}")
     print(f"  Test AUC: {roc_auc_score(y_tst, test_blended):.4f}")
-    print(f"  Test accuracy: {test_acc:.4f}")
+    print(f"  Test accuracy:          {test_acc:.4f}")
+    print(f"  Test balanced accuracy: {test_bal_acc:.4f}")
 
     # 5. MLP for backward-compat
     print("\n[4/5] Training MLP-21 for inference backward-compat …")

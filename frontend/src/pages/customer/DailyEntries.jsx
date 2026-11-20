@@ -16,7 +16,7 @@ import { useAuth } from "../../context/AuthContext";
 import {
   addEntry, listEntries, deleteEntry,
   getMonthlySummary, getEntryCategories,
-  getPaymentMethodSummary,
+  getPaymentMethodSummary, getFinancialHealth,
 } from "../../services/api";
 
 // ── Constants ─────────────────────────────────────────────────────────────────
@@ -109,6 +109,7 @@ export default function DailyEntries() {
 
   // charts
   const [summary,      setSummary]      = useState(null);
+  const [health,       setHealth]        = useState(null);   // same source as dashboard
   const [chartMonths,  setChartMonths]  = useState(6);
   const [paymentBreak, setPaymentBreak] = useState(null);
 
@@ -142,8 +143,12 @@ export default function DailyEntries() {
   const loadSummary = useCallback(async () => {
     if (!customerId) return;
     try {
-      const res = await getMonthlySummary(customerId, chartMonths);
+      const [res, h] = await Promise.all([
+        getMonthlySummary(customerId, chartMonths),
+        getFinancialHealth(customerId),
+      ]);
       setSummary(res);
+      setHealth(h);
     } catch { /* ignore */ }
   }, [customerId, chartMonths]);
 
@@ -175,13 +180,15 @@ export default function DailyEntries() {
         amount:         Number(form.amount),
         payment_method: form.payment_method || null,
       });
-      setSubmitMsg({ ok: true, text: "Entry added! Credit score updated." });
+      // res includes new_credit_score — update session immediately
+      if (res?.new_credit_score) {
+        setLatestScore(res.new_credit_score);
+      }
+      setSubmitMsg({ ok: true, text: `Entry added! Credit score updated to ${res?.new_credit_score ?? "—"}.` });
       setForm((f) => ({ ...f, amount: "", note: "", category: "", payment_method: "" }));
       loadEntries();
       loadSummary();
       loadPaymentBreak();
-      // Refresh credit score shown in session (backend computed it)
-      // We'll fetch the updated score via the response header or by re-fetching profile
     } catch (err) {
       setSubmitMsg({ ok: false, text: err?.response?.data?.detail || "Failed to add entry." });
     } finally {
@@ -217,19 +224,22 @@ export default function DailyEntries() {
       />
 
       {/* ── Summary cards + credit score ── */}
-      {summary && (
+      {(summary || health) && (
         <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 mb-5">
-          {(["income", "expense", "savings"] ).map((t) => {
+          {[
+            { t: "income",  val: health?.monthly_income   ?? summary?.averages?.monthly_income   ?? 0 },
+            { t: "expense", val: health?.monthly_spending ?? summary?.averages?.monthly_expense  ?? 0 },
+            { t: "savings", val: health?.savings          ?? summary?.averages?.monthly_savings  ?? 0 },
+          ].map(({ t, val }) => {
             const meta = TYPE_META[t];
             const Icon = meta.icon;
-            const avg  = summary.averages[`monthly_${t}`] ?? 0;
             return (
               <div key={t} className={`glass rounded-2xl p-4 border ${meta.border}`}>
                 <div className={`inline-flex items-center gap-1.5 text-xs font-medium ${meta.color} mb-1`}>
                   <Icon className="h-3.5 w-3.5" /> {meta.label}
                 </div>
                 <p className="font-display font-semibold text-lg">
-                  ₹{avg.toLocaleString("en-IN", { maximumFractionDigits: 0 })}
+                  ₹{val.toLocaleString("en-IN", { maximumFractionDigits: 0 })}
                 </p>
                 <p className="text-[10px] text-muted mt-0.5">avg / month</p>
               </div>
@@ -241,10 +251,10 @@ export default function DailyEntries() {
               <ShieldCheck className="h-3.5 w-3.5" /> Credit Score
             </div>
             <p className={`font-display font-semibold text-lg ${
-              (user?.credit_score ?? 650) >= 700 ? "text-success" :
-              (user?.credit_score ?? 650) >= 600 ? "text-accent" : "text-warning"
+              (latestScore ?? health?.credit_score ?? user?.credit_score ?? 650) >= 700 ? "text-success" :
+              (latestScore ?? health?.credit_score ?? user?.credit_score ?? 650) >= 600 ? "text-accent" : "text-warning"
             }`}>
-              {user?.credit_score ?? 650}
+              {latestScore ?? user?.credit_score ?? 650}
             </p>
             <p className="text-[10px] text-muted mt-0.5">auto-updated on save</p>
           </div>

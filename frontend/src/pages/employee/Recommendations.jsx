@@ -6,18 +6,18 @@ import PageHeader from "../../components/layout/PageHeader";
 import RecommendationCard from "../../components/cards/RecommendationCard";
 import Loading from "../../components/common/Loading";
 import ErrorState from "../../components/common/ErrorState";
-import { getRecommendations } from "../../services/api";
+import { getRecommendations, getCustomer } from "../../services/api";
 import { useAuth } from "../../context/AuthContext";
 
 export default function Recommendations() {
   const { user } = useAuth();
   const isCustomer = user?.role === "customer";
 
-  // For customers, always use their own ID. For employees, use the search box.
-  const [id, setId]         = useState(isCustomer ? user.customer_id : "");
-  const [data, setData]     = useState(null);
-  const [error, setError]   = useState(null);
-  const [loading, setLoading] = useState(false);
+  const [id, setId]             = useState(isCustomer ? user.customer_id : "");
+  const [data, setData]         = useState(null);
+  const [creditScore, setCreditScore] = useState(null);
+  const [error, setError]       = useState(null);
+  const [loading, setLoading]   = useState(false);
 
   const load = async (targetId) => {
     const cid = (targetId ?? id).trim();
@@ -25,8 +25,12 @@ export default function Recommendations() {
     setLoading(true);
     setError(null);
     try {
-      const res = await getRecommendations(cid);
+      const [res, profile] = await Promise.all([
+        getRecommendations(cid),
+        getCustomer(cid).catch(() => null),
+      ]);
       setData(res);
+      setCreditScore(profile?.credit_score ?? null);
     } catch (e) {
       setError(e);
     } finally {
@@ -91,7 +95,9 @@ export default function Recommendations() {
               </div>
               <div className="ml-auto text-right hidden sm:block">
                 <p className="text-xs text-muted">Credit Score</p>
-                <p className="font-display font-semibold text-accent">{user.credit_score ?? "—"}</p>
+                <p className="font-display font-semibold text-accent">
+                  {creditScore ?? user?.credit_score ?? "—"}
+                </p>
               </div>
             </div>
           )}
